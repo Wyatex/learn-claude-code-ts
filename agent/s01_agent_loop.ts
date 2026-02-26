@@ -1,53 +1,30 @@
-#!/usr/bin/env bun
-/**
- * s01_agent_loop.ts - The Agent Loop
- *
- * The entire secret of an AI coding agent in one pattern:
- *
- *     while (stop_reason === "tool_use") {
- *         response = await LLM(messages, tools)
- *         execute tools
- *         append results
- *     }
- *
- *     +----------+      +-------+      +---------+
- *     |   User   | ---> |  LLM  | ---> |  Tool   |
- *     |  prompt  |      |       |      | execute |
- *     +----------+      +---+---+      +----+----+
- *                           ^               |
- *                           |   tool_result |
- *                           +---------------+
- *                           (loop continues)
- *
- * This is the core loop: feed tool results back to the model
- * until the model decides to stop. Production agents layer
- * policy, hooks, and lifecycle controls on top.
- */
 
-import { Anthropic } from "@anthropic-ai/sdk";
-import type { MessageParam, Tool, ToolResultBlockParam } from "@anthropic-ai/sdk/resources/messages";
+import OpenAI from "openai";
+import type { 
+  ChatCompletionMessageParam, 
+  ChatCompletionTool 
+} from "openai/resources/chat/completions";
 
-// Bun natively loads .env files, no dotenv package needed.
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
-const client = new Anthropic({
-  baseURL: process.env.ANTHROPIC_BASE_URL,
-  apiKey: process.env.ANTHROPIC_API_KEY || "dummy-key",
+const client = new OpenAI({
+  baseURL: process.env.OPENAI_BASE_URL,
+  apiKey: process.env.OPENAI_API_KEY || "dummy-key",
 });
 
-const MODEL = process.env.MODEL_ID as string;
+const MODEL = process.env.MODEL_ID || "gpt-4o";
 const SYSTEM = `You are a coding agent at ${process.cwd()}. Use bash to solve tasks. Act, don't explain.`;
 
-const TOOLS: Tool[] =[{
-  name: "bash",
-  description: "Run a shell command.",
-  input_schema: {
-    type: "object",
-    properties: { command: { type: "string" } },
-    required: ["command"],
-  },
+// OpenAI 格式的 tools 定义
+const TOOLS: ChatCompletionTool[] =[{
+  type: "function",
+  function: {
+    name: "bash",
+    description: "Run a shell command.",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
+  }
 }];
 
 async function runBash(command: string): Promise<string> {
@@ -83,50 +60,60 @@ async function runBash(command: string): Promise<string> {
 }
 
 // -- The core pattern: a while loop that calls tools until the model stops --
-async function agentLoop(messages: MessageParam[]) {
+async function agentLoop(messages: ChatCompletionMessageParam[]) {
   while (true) {
-    const response = await client.messages.create({
+    const response = await client.chat.completions.create({
       model: MODEL,
-      system: SYSTEM,
       messages: messages,
       tools: TOOLS,
-      max_tokens: 8000,
     });
 
-    // Append assistant turn
-    messages.push({ role: "assistant", content: response.content });
+    const responseMessage = response.choices[0].message;
+    
+    // Append assistant turn (包括可能存在的 tool_calls)
+    messages.push(responseMessage);
 
-    // If the model didn't call a tool, we're done
-    if (response.stop_reason !== "tool_use") {
+    const finishReason = response.choices[0].finish_reason;
+
+    // 如果模型没有调用工具（即 finish_reason 不是 tool_calls），则代表当前任务闭环结束
+    if (finishReason !== "tool_calls" || !responseMessage.tool_calls) {
       return;
     }
 
     // Execute each tool call, collect results
-    const results: ToolResultBlockParam[] =[];
-    for (const block of response.content) {
-      if (block.type === "tool_use") {
-        // 修复 1: 显式声明类型并提供默认值/类型推断，确保 command 一定是 string
-        const input = block.input as Record<string, unknown>;
-        const command = typeof input.command === "string" ? input.command : String(input.command || "");
+    for (const toolCall of responseMessage.tool_calls) {
+      if (toolCall.function.name === "bash") {
+        // OpenAI 的 arguments 是字符串形式的 JSON，需要解析
+        let args: Record<string, unknown> = {};
+        try {
+          args = JSON.parse(toolCall.function.arguments);
+        } catch (e) {
+          args = { command: "" }; // Fallback 如果 JSON 损坏
+        }
+        
+        const command = typeof args.command === "string" ? args.command : String(args.command || "");
         
         console.log(`\x1b[33m$ ${command}\x1b[0m`);
         
         const output = await runBash(command);
         console.log(output.substring(0, 200));
         
-        results.push({
-          type: "tool_result",
-          tool_use_id: block.id,
+        // 将工具执行结果作为独立的消息追加
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
           content: output,
         });
       }
     }
-    messages.push({ role: "user", content: results });
   }
 }
 
 async function main() {
-  const history: MessageParam[] =[];
+  // OpenAI 推荐将 System Prompt 作为数组的第一条消息传入
+  const history: ChatCompletionMessageParam[] =[
+    { role: "system", content: SYSTEM }
+  ];
   
   process.stdout.write("\x1b[36ms01 >> \x1b[0m");
   
@@ -146,13 +133,9 @@ async function main() {
       
       // Output the final text reasoning
       const lastMessage = history[history.length - 1];
-      // 修复 2: 添加 lastMessage 的判空处理
-      if (lastMessage && Array.isArray(lastMessage.content)) {
-        for (const block of lastMessage.content) {
-          if (block.type === "text") {
-            console.log(block.text);
-          }
-        }
+      // OpenAI 的最后一条消息 content 是单纯的字符串（或 null），不需要遍历 block
+      if (lastMessage && lastMessage.role === "assistant" && lastMessage.content) {
+        console.log(lastMessage.content);
       }
     } catch (e) {
       console.error("\x1b[31mError during agent loop:\x1b[0m", e);
@@ -162,3 +145,5 @@ async function main() {
     process.stdout.write("\x1b[36ms01 >> \x1b[0m");
   }
 }
+
+main()
